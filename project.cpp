@@ -78,28 +78,27 @@ int main() {
 
   return 0;
 }
-
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import jwt
-import logging
-import uvicorn
-from typing import Dict, Optional
+from langchain_chroma import Chroma
+from pydantic import BaseModel
+from typing import Dict, List, Optional
+import json
+import os
 from datetime import datetime
-
-# Import your OLAP processing classes
-from olap_processor import (
-    OLAPQueryProcessor, 
-    setup_logging
-)
-
-# Set up logging
-logger = logging.getLogger('olap_genai')
-logger.setLevel(logging.INFO)
+import logging
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain_openai import AzureChatOpenAI
+from langchain.memory import ConversationBufferMemory
+import asyncio
+from pathlib import Path
+import uvicorn
+from cube_query_v3 import OLAPQueryProcessor
 
 # Initialize FastAPI app
-app = FastAPI(title="OLAP Query Generation API")
+app = FastAPI(title="Cube Query Generation API")
 
 # Add CORS middleware
 app.add_middleware(
@@ -110,101 +109,156 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for request/response
+# Pydantic models
 class QueryRequest(BaseModel):
     user_query: str
-    cube_id: str
+    cube_id: int
 
 class QueryResponse(BaseModel):
     message: str
     cube_query: Optional[str] = None
-    dimensions: Optional[Dict] = None
-    measures: Optional[Dict] = None
-    processing_time: Optional[float] = None
 
-# Initialize OLAP processor with configuration
-config_path = "text2sql/config.json"
-olap_processors = {}  # Dictionary to store processors for each user
+# Configuration and storage paths
+history_file = "conversation_history.json"
+vector_db_path = "vector_db"
+config_file = "text2sql/config.json"
 
-# Token verification dependency
-async def verify_token(request: Request):
-    token = request.headers.get('authorization')
-    if not token:
+# Initialize logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='api.log'
+)
+
+class History:
+    def __init__(self, history_file: str = history_file):
+        self.history_file = history_file
+        self.history = self.load()
+
+    def load(self) -> Dict:
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logging.error(f"Error loading conversation history: {e}")
+            return {}
+
+    def save(self, history: Dict):
+        try:
+            with open(self.history_file, 'w') as f:
+                json.dump(history, f, indent=4)
+        except Exception as e:
+            logging.error(f"Error saving conversation history: {e}")
+
+    def update(self, user_id: str, query_data: Dict):
+        if user_id not in self.history:
+            self.history[user_id] = []
+
+        self.history[user_id].append({
+            "timestamp": datetime.now().isoformat(),
+            "query": query_data["query"],
+            "dimensions": query_data["dimensions"],
+            "measures": query_data["measures"],
+            "response": query_data["response"]
+        })
+        self.history[user_id] = self.history[user_id][-5:]
+        self.save(self.history)
+
+# Token verification
+async def verify_token(authorization: str = Header(None)):
+    if not authorization:
         raise HTTPException(status_code=401, detail="No authorization token provided")
     
     try:
-        token = token.split(" ")[1]
+        token = authorization.split(" ")[1]
         payload = jwt.decode(token, options={"verify_signature": False})
-        return payload.get("preferred_username")
+        user_details = payload.get("preferred_username")
+        if not user_details:
+            raise ValueError("No user details in token")
+        
+        return user_details
     except Exception as e:
-        logger.error(f"Token verification failed: {str(e)}")
+        logging.error(f"Token verification failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
+
+# Initialize OLAP processor dictionary
+olap_processors = {}
+
+async def process_query(
+    user_query: str,
+    cube_id: int,
+    user_id: str
+) -> Dict:
+    try:
+        # Get or create processor for this user
+        if user_id not in olap_processors:
+            olap_processors[user_id] = OLAPQueryProcessor(config_file)
+
+        processor = olap_processors[user_id]
+        query, final_query, processing_time, dimensions, measures = processor.process_query(user_query)
+
+        # Prepare response data
+        response_data = {
+            "query": query,
+            "dimensions": dimensions,
+            "measures": measures,
+            "response": final_query,
+        }
+
+        # Update conversation history
+        history_manager = History()
+        history_manager.update(user_id, response_data)
+
+        return {
+            "message": "success",
+            "cube_query": final_query
+        }
+    except Exception as e:
+        logging.error(f"Error processing query: {e}")
+        return {
+            "message": "failure",
+            "cube_query": None
+        }
 
 @app.post("/genai/cube/query_generation", response_model=QueryResponse)
 async def generate_cube_query(
     request: QueryRequest,
-    username: str = Depends(verify_token)
+    user_details: str = Depends(verify_token)
 ):
     try:
-        # Get or create processor for this user
-        if username not in olap_processors:
-            olap_processors[username] = OLAPQueryProcessor(config_path)
-            logger.info(f"Created new OLAP processor for user: {username}")
+        user_id = f"user_{user_details}"
 
-        processor = olap_processors[username]
-
-        # Process the query
-        original_query, final_query, processing_time, dimensions, measures = processor.process_query(request.user_query)
-
-        # Prepare response
-        response = {
-            "message": "success",
-            "cube_query": final_query,
-            "dimensions": dimensions,
-            "measures": measures,
-            "processing_time": processing_time
-        }
-
-        # Log the successful query
-        logger.info(f"Successfully processed query for user {username}")
-        logger.info(f"Query: {original_query}")
-        logger.info(f"Generated OLAP query: {final_query}")
-
-        return QueryResponse(**response)
-
-    except Exception as e:
-        logger.error(f"Error processing query for user {username}: {str(e)}")
-        return QueryResponse(
-            message="failure",
-            cube_query=None,
-            dimensions=None,
-            measures=None,
-            processing_time=None
+        # Process query
+        result = await process_query(
+            request.user_query,
+            request.cube_id,
+            user_id
         )
 
-# Endpoint to clear conversation history
-@app.post("/genai/cube/clear_history")
-async def clear_history(username: str = Depends(verify_token)):
-    try:
-        if username in olap_processors:
-            del olap_processors[username]
-            logger.info(f"Cleared conversation history for user: {username}")
-        return {"message": "success", "detail": "Conversation history cleared"}
+        return QueryResponse(
+            message=result["message"],
+            cube_query=result["cube_query"]
+        )
+    except HTTPException as he:
+        return QueryResponse(message="failure", cube_query=None)
     except Exception as e:
-        logger.error(f"Error clearing history for user {username}: {str(e)}")
-        return {"message": "failure", "detail": str(e)}
+        logging.error(f"Error in generate_cube_query: {e}")
+        return QueryResponse(message="failure", cube_query=None)
 
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    try:
+        Path(vector_db_path).mkdir(parents=True, exist_ok=True)
+        if not os.path.exists(history_file):
+            with open(history_file, 'w') as f:
+                json.dump({}, f)
+        logging.info("API startup completed successfully")
+    except Exception as e:
+        logging.error(f"Error during startup: {e}")
+        raise
 
 if __name__ == "__main__":
-    setup_logging()
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8085,
-        workers=4,
-        log_level="info"
-    )
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
