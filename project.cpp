@@ -79,207 +79,128 @@ int main() {
   return 0;
 }
 
-
-from fastapi import APIRouter, FastAPI, Header, Request, HTTPException, Depends
-from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
-import uvicorn
-import logging
-import uuid
-import json
-import time
-import threading
-from threading import Thread
-import os
-import glob
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Annotated, Dict, Optional, List
 import jwt
+import logging
+import uvicorn
+from typing import Dict, Optional
 from datetime import datetime
 
-# Import your OLAP processor classes
-from your_olap_module import OLAPQueryProcessor, QueryContext, ConversationManager
-
-# Constants
-DATA_FOLDER = "./datafolder/json/"
-CONVERSATION_FOLDER = "./datafolder/conversations/"
-os.makedirs(DATA_FOLDER, exist_ok=True)
-os.makedirs(CONVERSATION_FOLDER, exist_ok=True)
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# Import your OLAP processing classes
+from olap_processor import (
+    OLAPQueryProcessor, 
+    setup_logging
 )
+
+# Set up logging
 logger = logging.getLogger('olap_genai')
+logger.setLevel(logging.INFO)
 
-# Pydantic models
-class CubeImportRequest(BaseModel):
-    cube_json: dict
-    cube_id: str
+# Initialize FastAPI app
+app = FastAPI(title="OLAP Query Generation API")
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models for request/response
 class QueryRequest(BaseModel):
     user_query: str
     cube_id: str
 
 class QueryResponse(BaseModel):
-    query: str
-    dimensions: Dict
-    measures: Dict
-    olap_query: str
-    timestamp: float
-    conversation_id: str
+    message: str
+    cube_query: Optional[str] = None
+    dimensions: Optional[Dict] = None
+    measures: Optional[Dict] = None
+    processing_time: Optional[float] = None
 
-# Global storage for user sessions
-user_sessions: Dict[str, OLAPQueryProcessor] = {}
-conversation_locks: Dict[str, threading.Lock] = {}
+# Initialize OLAP processor with configuration
+config_path = "text2sql/config.json"
+olap_processors = {}  # Dictionary to store processors for each user
 
-# FastAPI app and router
-app = FastAPI(title="OLAP GenAI API")
-router = APIRouter()
-
-def get_user_from_token(token: str) -> str:
-    """Extract and validate user from JWT token"""
+# Token verification dependency
+async def verify_token(request: Request):
+    token = request.headers.get('authorization')
+    if not token:
+        raise HTTPException(status_code=401, detail="No authorization token provided")
+    
     try:
+        token = token.split(" ")[1]
         payload = jwt.decode(token, options={"verify_signature": False})
-        user_id = payload.get("preferred_username")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
+        return payload.get("preferred_username")
     except Exception as e:
+        logger.error(f"Token verification failed: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
-def get_conversation_file(user_id: str, cube_id: str) -> str:
-    """Get the conversation file path for a user and cube"""
-    return os.path.join(CONVERSATION_FOLDER, f"{user_id}_{cube_id}_conversation.json")
-
-def load_conversation_history(user_id: str, cube_id: str) -> List[Dict]:
-    """Load conversation history from file"""
-    file_path = get_conversation_file(user_id, cube_id)
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"Error loading conversation history: {e}")
-    return []
-
-def save_conversation_history(user_id: str, cube_id: str, conversation: Dict):
-    """Save conversation history to file"""
-    file_path = get_conversation_file(user_id, cube_id)
-    try:
-        with open(file_path, 'w') as f:
-            json.dump(conversation, f, indent=2)
-    except Exception as e:
-        logger.error(f"Error saving conversation history: {e}")
-
-def get_or_create_processor(user_id: str, cube_id: str) -> OLAPQueryProcessor:
-    """Get or create an OLAP processor for a user"""
-    session_key = f"{user_id}_{cube_id}"
-    if session_key not in user_sessions:
-        config_path = os.path.join(DATA_FOLDER, f"{cube_id}_config.json")
-        processor = OLAPQueryProcessor(config_path)
-        user_sessions[session_key] = processor
-        conversation_locks[session_key] = threading.Lock()
-    return user_sessions[session_key]
-
-@router.post("/genai/cube_details_import")
-async def import_cube_details(
-    request: Request,
-    cube_data: CubeImportRequest
+@app.post("/genai/cube/query_generation", response_model=QueryResponse)
+async def generate_cube_query(
+    request: QueryRequest,
+    username: str = Depends(verify_token)
 ):
-    """Import cube details and configuration"""
-    token = request.headers.get('authorization', '').split(" ")[1]
-    user_id = get_user_from_token(token)
-    
     try:
-        # Save cube configuration
-        config_path = os.path.join(DATA_FOLDER, f"{cube_data.cube_id}_config.json")
-        with open(config_path, 'w') as f:
-            json.dump(cube_data.cube_json, f, indent=2)
-            
-        return JSONResponse(
-            status_code=200,
-            content={"message": "success", "cube_id": cube_data.cube_id}
-        )
+        # Get or create processor for this user
+        if username not in olap_processors:
+            olap_processors[username] = OLAPQueryProcessor(config_path)
+            logger.info(f"Created new OLAP processor for user: {username}")
+
+        processor = olap_processors[username]
+
+        # Process the query
+        original_query, final_query, processing_time, dimensions, measures = processor.process_query(request.user_query)
+
+        # Prepare response
+        response = {
+            "message": "success",
+            "cube_query": final_query,
+            "dimensions": dimensions,
+            "measures": measures,
+            "processing_time": processing_time
+        }
+
+        # Log the successful query
+        logger.info(f"Successfully processed query for user {username}")
+        logger.info(f"Query: {original_query}")
+        logger.info(f"Generated OLAP query: {final_query}")
+
+        return QueryResponse(**response)
+
     except Exception as e:
-        logger.error(f"Error importing cube details: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"message": "failure", "error": str(e)}
+        logger.error(f"Error processing query for user {username}: {str(e)}")
+        return QueryResponse(
+            message="failure",
+            cube_query=None,
+            dimensions=None,
+            measures=None,
+            processing_time=None
         )
 
-@router.post("/genai/query")
-async def process_query(
-    request: Request,
-    query_request: QueryRequest
-):
-    """Process a query and maintain conversation history"""
-    token = request.headers.get('authorization', '').split(" ")[1]
-    user_id = get_user_from_token(token)
-    
-    session_key = f"{user_id}_{query_request.cube_id}"
-    
+# Endpoint to clear conversation history
+@app.post("/genai/cube/clear_history")
+async def clear_history(username: str = Depends(verify_token)):
     try:
-        with conversation_locks[session_key]:
-            processor = get_or_create_processor(user_id, query_request.cube_id)
-            
-            # Process the query
-            query, olap_query, processing_time, dimensions, measures = processor.process_query(query_request.user_query)
-            
-            # Create response
-            response = {
-                "query": query,
-                "dimensions": dimensions,
-                "measures": measures,
-                "olap_query": olap_query,
-                "timestamp": time.time(),
-                "conversation_id": str(uuid.uuid4()),
-                "processing_time": processing_time
-            }
-            
-            # Save conversation history
-            conversation_history = load_conversation_history(user_id, query_request.cube_id)
-            conversation_history.append(response)
-            save_conversation_history(user_id, query_request.cube_id, conversation_history)
-            
-            return JSONResponse(
-                status_code=200,
-                content={"message": "success", "response": response}
-            )
-            
+        if username in olap_processors:
+            del olap_processors[username]
+            logger.info(f"Cleared conversation history for user: {username}")
+        return {"message": "success", "detail": "Conversation history cleared"}
     except Exception as e:
-        logger.error(f"Error processing query: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"message": "failure", "error": str(e)}
-        )
+        logger.error(f"Error clearing history for user {username}: {str(e)}")
+        return {"message": "failure", "detail": str(e)}
 
-@router.get("/genai/conversation_history")
-async def get_conversation_history(
-    request: Request,
-    cube_id: str
-):
-    """Get conversation history for a user and cube"""
-    token = request.headers.get('authorization', '').split(" ')[1]
-    user_id = get_user_from_token(token)
-    
-    try:
-        history = load_conversation_history(user_id, cube_id)
-        return JSONResponse(
-            status_code=200,
-            content={"message": "success", "history": history}
-        )
-    except Exception as e:
-        logger.error(f"Error retrieving conversation history: {e}")
-        return JSONResponse(
-            status_code=500,
-            content={"message": "failure", "error": str(e)}
-        )
-
-app.include_router(router)
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
+    setup_logging()
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
