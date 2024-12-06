@@ -78,327 +78,37 @@ int main() {
 
   return 0;
 }
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-import jwt
-from langchain_chroma import Chroma
-from pydantic import BaseModel
-from typing import Dict, List, Optional
-import json
-import os
-from datetime import datetime
-import logging
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain.chains import RetrievalQA
-from langchain_openai import AzureChatOpenAI
-from langchain.memory import ConversationBufferMemory
-import asyncio
-from pathlib import Path
-import uvicorn
-from cube_query_v3 import OLAPQueryProcessor
+{
+    "llm": {
 
-# Initialize FastAPI app
-app = FastAPI(title="OLAP Cube Management API")
+        "OPENAI_API_TYPE":"azure",
+        "OPENAI_API_KEY" :"c3ecb5d7c1fb4244bfb5483ff308b2f1",
+        "AZURE_OPENAI_ENDPOINT" :"https://crisil-gen-ai-uat.openai.azure.com/" ,
+        "OPENAI_API_VERSION" :"2024-02-15-preview",
+        "DEPLOYMENT_NAME" :"gpt-4o-mini",
+        "temperature": 0,
+        "seed":42,
+        "model":"gpt-4o-mini",
+        "ENDPOINT": "https://crisil-gen-ai-uat.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview",
+        "top_p": 0.95,
+        "max_tokens": 80000
+    },
+    "embedding": {
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        "deployment":"text-embedding-3-small",
+        "show_progress_bar": "False"
+    },
 
-# Pydantic models
-class QueryRequest(BaseModel):
-    user_query: str
-    cube_id: int
+    "vector_embedding_path": {
 
-class QueryResponse(BaseModel):
-    message: str
-    cube_query: Optional[str] = None
+        "dimensions": "./vectordb_nov24/dimensions",
+        "measures": "./vectordb_nov24/measures"
+    },
+    "directories": {
 
-class CubeDetailsRequest(BaseModel):
-    cube_json: Dict
-    cube_id: str
+        "excel_file_path": "./golden_30_with_gt.xlsx",
+        "output_file_path": "./output/v2/gpt-4o-mini.csv"
 
-class CubeDetailsResponse(BaseModel):
-    message: str
+    }
 
-# Configuration and storage paths
-BASE_DIR = os.getcwd()  # Get current working directory
-CUBE_DETAILS_DIR = os.path.join(BASE_DIR, "cube_details")
-IMPORT_HISTORY_FILE = os.path.join(BASE_DIR, "import_history.json")
-history_file = os.path.join(BASE_DIR, "conversation_history.json")
-vector_db_path = os.path.join(BASE_DIR, "vector_db")
-config_file = os.path.join(BASE_DIR, "text2sql/config.json")
-
-# Azure OpenAI Configuration
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2023-05-15")
-
-# Initialize logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='api.log'
-)
-
-class VectorStore:
-    def __init__(self, persist_directory: str):
-        self.embeddings = AzureOpenAIEmbeddings(
-            azure_deployment=AZURE_DEPLOYMENT_NAME,
-            openai_api_version=AZURE_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            openai_api_key=AZURE_OPENAI_API_KEY
-        )
-        self.vectorstore = Chroma(
-            persist_directory=persist_directory,
-            embedding_function=self.embeddings
-        )
-
-    def add_cube_details(self, cube_id: str, cube_json: Dict):
-        # Convert cube details to text format for embedding
-        cube_text = json.dumps(cube_json, indent=2)
-        metadata = {"cube_id": cube_id, "type": "cube_details"}
-        
-        # Add to vector store
-        self.vectorstore.add_texts(
-            texts=[cube_text],
-            metadatas=[metadata]
-        )
-        self.vectorstore.persist()
-
-    def search_similar_cubes(self, query: str, k: int = 3):
-        return self.vectorstore.similarity_search(query, k=k)
-
-class History:
-    def __init__(self, history_file: str = history_file):
-        self.history_file = history_file
-        self.history = self.load()
-
-    def load(self) -> Dict:
-        try:
-            if os.path.exists(self.history_file):
-                with open(self.history_file, 'r') as f:
-                    return json.load(f)
-            return {}
-        except Exception as e:
-            logging.error(f"Error loading conversation history: {e}")
-            return {}
-
-    def save(self, history: Dict):
-        try:
-            with open(self.history_file, 'w') as f:
-                json.dump(history, f, indent=4)
-        except Exception as e:
-            logging.error(f"Error saving conversation history: {e}")
-
-    def update(self, user_id: str, query_data: Dict):
-        if user_id not in self.history:
-            self.history[user_id] = []
-
-        self.history[user_id].append({
-            "timestamp": datetime.now().isoformat(),
-            "query": query_data["query"],
-            "dimensions": query_data["dimensions"],
-            "measures": query_data["measures"],
-            "response": query_data["response"]
-        })
-        self.history[user_id] = self.history[user_id][-5:]
-        self.save(self.history)
-
-class ImportHistory:
-    def __init__(self, history_file: str = IMPORT_HISTORY_FILE):
-        self.history_file = history_file
-        self.history = self.load()
-
-    def load(self) -> Dict:
-        try:
-            if os.path.exists(self.history_file):
-                with open(self.history_file, 'r') as f:
-                    return json.load(f)
-            return {}
-        except Exception as e:
-            logging.error(f"Error loading import history: {e}")
-            return {}
-    
-    def save(self, history: Dict):
-        try:
-            with open(self.history_file, 'w') as f:
-                json.dump(history, f, indent=4)
-        except Exception as e:
-            logging.error(f"Error saving import history: {e}")
-
-    def update(self, user_id: str, cube_id: str, status: str):
-        if user_id not in self.history:
-            self.history[user_id] = []
-
-        new_import = {
-            "timestamp": datetime.now().isoformat(),
-            "cube_id": cube_id,
-            "status": status
-        }
-
-        self.history[user_id].append(new_import)
-        self.history[user_id] = self.history[user_id][-5:]
-        self.save(self.history)
-
-# Token verification
-async def verify_token(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="No authorization token provided")
-    
-    try:
-        token = authorization.split(" ")[1]
-        payload = jwt.decode(token, options={"verify_signature": False})
-        user_details = payload.get("preferred_username")
-        if not user_details:
-            raise ValueError("No user details in token")
-        
-        return user_details
-    except Exception as e:
-        logging.error(f"Token verification failed: {e}")
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# Initialize OLAP processor dictionary
-olap_processors = {}
-
-async def process_query(user_query: str, cube_id: int, user_id: str) -> Dict:
-    try:
-        # Get or create processor for this user
-        if user_id not in olap_processors:
-            olap_processors[user_id] = OLAPQueryProcessor(config_file)
-
-        processor = olap_processors[user_id]
-        
-        # Use vector store to find similar cube patterns
-        similar_cubes = app.state.vectorstore.search_similar_cubes(user_query)
-        
-        # Process the query with context from similar cubes
-        query, final_query, processing_time, dimensions, measures = processor.process_query(
-            user_query,
-            context=similar_cubes
-        )
-        
-        # Prepare response data
-        response_data = {
-            "query": query,
-            "dimensions": dimensions,
-            "measures": measures,
-            "response": final_query,
-        }
-
-        # Update conversation history
-        history_manager = History()
-        history_manager.update(user_id, response_data)
-
-        return {
-            "message": "success",
-            "cube_query": final_query
-        }
-    except Exception as e:
-        logging.error(f"Error processing query: {e}")
-        return {
-            "message": "failure",
-            "cube_query": None
-        }
-
-async def process_cube_details(cube_json: Dict, cube_id: str, user_id: str) -> Dict:
-    try:
-        # Save cube details to file
-        cube_dir = os.path.join(CUBE_DETAILS_DIR, cube_id)
-        os.makedirs(cube_dir, exist_ok=True)
-
-        cube_file = os.path.join(cube_dir, f"cube_details.json")
-        with open(cube_file, 'w') as f:
-            json.dump(cube_json, f, indent=4)
-
-        # Add to vector store
-        app.state.vectorstore.add_cube_details(cube_id, cube_json)
-
-        # Update import history
-        history_manager = ImportHistory()
-        history_manager.update(user_id, cube_id, "success")
-
-        return {"message": "success"}
-    except Exception as e:
-        logging.error(f"Error processing cube details: {e}")
-        return {"message": "failure"}
-
-@app.post("/genai/cube/query_generation", response_model=QueryResponse)
-async def generate_cube_query(
-    request: QueryRequest,
-    user_details: str = Depends(verify_token)
-):
-    try:
-        user_id = f"user_{user_details}"
-        result = await process_query(
-            request.user_query,
-            request.cube_id,
-            user_id
-        )
-        return QueryResponse(
-            message=result["message"],
-            cube_query=result["cube_query"]
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logging.error(f"Error in generate_cube_query: {e}")
-        return QueryResponse(message="failure", cube_query=None)
-
-@app.post("/genai/cube_details_import", response_model=CubeDetailsResponse)
-async def import_cube_details(
-    request: CubeDetailsRequest,
-    user_details: str = Depends(verify_token)
-):
-    try:
-        user_id = f"user_{user_details}"
-        result = await process_cube_details(
-            request.cube_json,
-            request.cube_id,
-            user_id
-        )
-        return CubeDetailsResponse(message=result["message"])
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logging.error(f"Error in import_cube_details: {e}")
-        return CubeDetailsResponse(message="failure")
-
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    try:
-        # Create necessary directories using absolute paths
-        os.makedirs(CUBE_DETAILS_DIR, exist_ok=True)
-        os.makedirs(vector_db_path, exist_ok=True)
-        # No need to create directory for IMPORT_HISTORY_FILE since we're using BASE_DIR
-
-        # Initialize history files
-        for file in [IMPORT_HISTORY_FILE, history_file]:
-            if not os.path.exists(file):
-                with open(file, 'w') as f:
-                    json.dump({}, f)
-
-        # Initialize vector store
-        app.state.vectorstore = VectorStore(vector_db_path)
-
-        # Initialize Azure OpenAI chat model
-        app.state.llm = AzureChatOpenAI(
-            azure_deployment=AZURE_DEPLOYMENT_NAME,
-            openai_api_version=AZURE_API_VERSION,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            openai_api_key=AZURE_OPENAI_API_KEY
-        )
-
-        logging.info("API startup completed successfully")
-    except Exception as e:
-        logging.error(f"Error during startup: {e}")
-        raise
-
-if __name__ == "__main__":
-    uvicorn.run("olap_details_generat:app", host="127.0.0.1", port=8085, reload=True)
+}
