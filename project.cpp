@@ -78,7 +78,6 @@ int main() {
 
   return 0;
 }
-
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import jwt
@@ -127,12 +126,18 @@ class CubeDetailsResponse(BaseModel):
     message: str
 
 # Configuration and storage paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.getcwd()  # Get current working directory
 CUBE_DETAILS_DIR = os.path.join(BASE_DIR, "cube_details")
 IMPORT_HISTORY_FILE = os.path.join(BASE_DIR, "import_history.json")
-history_file = "conversation_history.json"
-vector_db_path = "vector_db"
-config_file = "text2sql/config.json"
+history_file = os.path.join(BASE_DIR, "conversation_history.json")
+vector_db_path = os.path.join(BASE_DIR, "vector_db")
+config_file = os.path.join(BASE_DIR, "text2sql/config.json")
+
+# Azure OpenAI Configuration
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2023-05-15")
 
 # Initialize logging
 logging.basicConfig(
@@ -140,6 +145,34 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     filename='api.log'
 )
+
+class VectorStore:
+    def __init__(self, persist_directory: str):
+        self.embeddings = AzureOpenAIEmbeddings(
+            azure_deployment=AZURE_DEPLOYMENT_NAME,
+            openai_api_version=AZURE_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            openai_api_key=AZURE_OPENAI_API_KEY
+        )
+        self.vectorstore = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=self.embeddings
+        )
+
+    def add_cube_details(self, cube_id: str, cube_json: Dict):
+        # Convert cube details to text format for embedding
+        cube_text = json.dumps(cube_json, indent=2)
+        metadata = {"cube_id": cube_id, "type": "cube_details"}
+        
+        # Add to vector store
+        self.vectorstore.add_texts(
+            texts=[cube_text],
+            metadatas=[metadata]
+        )
+        self.vectorstore.persist()
+
+    def search_similar_cubes(self, query: str, k: int = 3):
+        return self.vectorstore.similarity_search(query, k=k)
 
 class History:
     def __init__(self, history_file: str = history_file):
@@ -233,15 +266,23 @@ async def verify_token(authorization: str = Header(None)):
 # Initialize OLAP processor dictionary
 olap_processors = {}
 
-async def process_query(user_query: str,cube_id: int,user_id: str) -> Dict:
+async def process_query(user_query: str, cube_id: int, user_id: str) -> Dict:
     try:
         # Get or create processor for this user
         if user_id not in olap_processors:
             olap_processors[user_id] = OLAPQueryProcessor(config_file)
 
-
         processor = olap_processors[user_id]
-        query, final_query, processing_time, dimensions, measures = processor.process_query(user_query)
+        
+        # Use vector store to find similar cube patterns
+        similar_cubes = app.state.vectorstore.search_similar_cubes(user_query)
+        
+        # Process the query with context from similar cubes
+        query, final_query, processing_time, dimensions, measures = processor.process_query(
+            user_query,
+            context=similar_cubes
+        )
+        
         # Prepare response data
         response_data = {
             "query": query,
@@ -265,8 +306,9 @@ async def process_query(user_query: str,cube_id: int,user_id: str) -> Dict:
             "cube_query": None
         }
 
-async def process_cube_details(cube_json: Dict, cube_id: str,user_id: str) -> Dict:
+async def process_cube_details(cube_json: Dict, cube_id: str, user_id: str) -> Dict:
     try:
+        # Save cube details to file
         cube_dir = os.path.join(CUBE_DETAILS_DIR, cube_id)
         os.makedirs(cube_dir, exist_ok=True)
 
@@ -274,6 +316,10 @@ async def process_cube_details(cube_json: Dict, cube_id: str,user_id: str) -> Di
         with open(cube_file, 'w') as f:
             json.dump(cube_json, f, indent=4)
 
+        # Add to vector store
+        app.state.vectorstore.add_cube_details(cube_id, cube_json)
+
+        # Update import history
         history_manager = ImportHistory()
         history_manager.update(user_id, cube_id, "success")
 
@@ -283,7 +329,10 @@ async def process_cube_details(cube_json: Dict, cube_id: str,user_id: str) -> Di
         return {"message": "failure"}
 
 @app.post("/genai/cube/query_generation", response_model=QueryResponse)
-async def generate_cube_query(request: QueryRequest,user_details: str = Depends(verify_token)):
+async def generate_cube_query(
+    request: QueryRequest,
+    user_details: str = Depends(verify_token)
+):
     try:
         user_id = f"user_{user_details}"
         result = await process_query(
@@ -296,13 +345,16 @@ async def generate_cube_query(request: QueryRequest,user_details: str = Depends(
             cube_query=result["cube_query"]
         )
     except HTTPException as he:
-        return QueryResponse(message="failure", cube_query=None)
+        raise he
     except Exception as e:
         logging.error(f"Error in generate_cube_query: {e}")
         return QueryResponse(message="failure", cube_query=None)
 
 @app.post("/genai/cube_details_import", response_model=CubeDetailsResponse)
-async def import_cube_details(request: CubeDetailsRequest, user_details: str = Depends(verify_token)):
+async def import_cube_details(
+    request: CubeDetailsRequest,
+    user_details: str = Depends(verify_token)
+):
     try:
         user_id = f"user_{user_details}"
         result = await process_cube_details(
@@ -312,7 +364,7 @@ async def import_cube_details(request: CubeDetailsRequest, user_details: str = D
         )
         return CubeDetailsResponse(message=result["message"])
     except HTTPException as he:
-        return CubeDetailsResponse(message="failure")
+        raise he
     except Exception as e:
         logging.error(f"Error in import_cube_details: {e}")
         return CubeDetailsResponse(message="failure")
@@ -321,14 +373,27 @@ async def import_cube_details(request: CubeDetailsRequest, user_details: str = D
 @app.on_event("startup")
 async def startup_event():
     try:
+        # Create necessary directories using absolute paths
         os.makedirs(CUBE_DETAILS_DIR, exist_ok=True)
         os.makedirs(vector_db_path, exist_ok=True)
-        os.makedirs(os.path.dirname(IMPORT_HISTORY_FILE), exist_ok=True)
+        # No need to create directory for IMPORT_HISTORY_FILE since we're using BASE_DIR
 
+        # Initialize history files
         for file in [IMPORT_HISTORY_FILE, history_file]:
             if not os.path.exists(file):
                 with open(file, 'w') as f:
                     json.dump({}, f)
+
+        # Initialize vector store
+        app.state.vectorstore = VectorStore(vector_db_path)
+
+        # Initialize Azure OpenAI chat model
+        app.state.llm = AzureChatOpenAI(
+            azure_deployment=AZURE_DEPLOYMENT_NAME,
+            openai_api_version=AZURE_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            openai_api_key=AZURE_OPENAI_API_KEY
+        )
 
         logging.info("API startup completed successfully")
     except Exception as e:
