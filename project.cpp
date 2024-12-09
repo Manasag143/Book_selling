@@ -346,6 +346,91 @@ class DimensionMeasure:
         except Exception as e:
             logging.error(f"Error extracting measures: {e}")
             raise
+    def get_measures_with_error(self, query: str, cube_id: str, prev_conv: dict, error: str) -> str:
+    """Extracts measures with error correction logic"""
+    try:
+        with get_openai_callback() as msr_cb:
+            query_msr_error_inj = f"""
+            As a user query to cube query conversion expert, analyze the error message from applying the cube query. 
+            Your goal is to correct the identification of measures if they are incorrect.
+            
+            Below details using which the error occurred:-
+            User Query: {query}
+            Current Measures: {prev_conv["measures"]}
+            Current Cube Query Response: {prev_conv["response"]}
+            Error Message: {error}
+
+            <error_analysis_context>
+            - Analyze error message for specific measure-related issues
+            - Check for syntax errors in measure references
+            - Verify measures exist in the cube structure
+            - Look for aggregation function errors
+            - Identify calculation or formula errors
+            - Check for measure compatibility issues
+            </error_analysis_context>
+
+            <correction_guidelines>
+            - Fix measure name mismatches
+            - Correct aggregation functions
+            - Fix calculation formulas
+            - Add missing required measures
+            - Remove invalid measure combinations
+            - Preserve valid measure selections
+            
+            Response format:
+            '''json
+            {{
+                "measure_group_names": ["corrected_group1", "corrected_group2"],
+                "measure_names": ["corrected_measure1", "corrected_measure2"],
+                "corrections": ["Fixed measure X", "Updated aggregation Y"],
+                "reasoning": "Explanation of corrections made"
+            }}
+            '''
+            </correction_guidelines>
+
+            <examples>
+            1. Error: "Unknown measure [Sales].[Amount]"
+            Correction: Change to [Sales].[Sales Amount] as the correct measure name
+
+            2. Error: "Invalid aggregation function SUM for [Average Price]"
+            Correction: Change to AVG([Price].[Unit Price]) for correct aggregation
+
+            3. Error: "Incompatible measures [Profit] and [Margin %]"
+            Correction: Use [Sales].[Profit Amount] instead of incompatible combination
+
+            4. Error: "Calculation error in [Growth].[YoY]"
+            Correction: Add proper year-over-year calculation formula
+
+            5. Error: "Missing required base measure for [Running Total]"
+            Correction: Add base measure [Sales].[Amount] for running total calculation
+            </examples>
+            """
+
+            cube_dir = os.path.join(vector_db_path, cube_id)
+            cube_msr = os.path.join(cube_dir, "measures")
+            
+            load_embedding_msr = Chroma(
+                persist_directory=cube_msr,
+                embedding_function=self.embedding
+            )
+            retriever_msr = load_embedding_msr.as_retriever(search_kwargs={"k": 60})
+            
+            chain_msr = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                retriever=retriever_msr,
+                verbose=True,
+                return_source_documents=True
+            )
+            
+            result_msr = chain_msr.invoke({"query": query_msr_error_inj})
+            msr = result_msr.get('result')
+            
+            logging.info(f"Extracted corrected measures:\n {msr}")
+            return msr
+
+    except Exception as e:
+        logging.error(f"Error in measure correction: {str(e)}")
+        raise
 
 class OLAPQueryProcessor:
     """OLAP query processor with error handling."""
