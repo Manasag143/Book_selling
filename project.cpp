@@ -77,79 +77,10 @@ int main() {
   } while (choice != 4);
 
   return 0;
-}# Add these imports if not already present
-from typing import Literal, Optional
-from pydantic import BaseModel
-
-class UserFeedbackRequest(BaseModel):
-    user_feedback: str 
-    feedback: Literal["accepted", "rejected"]
-    cube_query: str
-    cube_id: str
-
-class UserFeedbackResponse(BaseModel):
-    message: str
-    cube_query: Optional[str] = None
-
-@app.post("/genai/user_feedback_injection", response_model=UserFeedbackResponse)
-async def handle_user_feedback(
-    request: UserFeedbackRequest,
-    user_details: str = Depends(verify_token)
-):
-    """Handle user feedback for cube queries"""
-    try:
-        user_id = f"user_{user_details}"
-        
-        if request.feedback == "rejected":
-            # Get or create processor
-            if user_id not in olap_processors:
-                olap_processors[user_id] = OLAPQueryProcessor(config_file)
-            
-            processor = olap_processors[user_id]
-            history_manager = History()
-            prev_conv = history_manager.retrieve(user_id)
-            
-            # Add feedback to context
-            prev_conv["user_feedback"] = request.user_feedback
-            prev_conv["feedback_query"] = request.cube_query
-            
-            # Process query with feedback context
-            query, final_query, _, dimensions, measures = processor.process_query(
-                request.user_feedback,
-                request.cube_id, 
-                prev_conv
-            )
-            
-            # Update history
-            response_data = {
-                "query": request.user_feedback,
-                "dimensions": dimensions,
-                "measures": measures,
-                "response": final_query
-            }
-            history_manager.update(user_id, response_data)
-            
-            return UserFeedbackResponse(
-                message="success",
-                cube_query=final_query
-            )
-            
-        return UserFeedbackResponse(
-            message="success", 
-            cube_query=request.cube_query
-        )
-        
-    except Exception as e:
-        logging.error(f"Error processing feedback: {e}")
-        return UserFeedbackResponse(
-            message="failure",
-            cube_query=None
-        )
+}
 
 
-
-
-  def get_dimensions(self, query: str, cube_id: str, prev_conv: dict) -> str:
+def get_dimensions(self, query: str, cube_id: str, prev_conv: dict) -> str:
     """Extract dimensions with feedback consideration"""
     try:
         with get_openai_callback() as dim_cb:
@@ -157,34 +88,53 @@ async def handle_user_feedback(
             feedback_section = ""
             if "user_feedback" in prev_conv:
                 feedback_section = f"""
-                Previous User Feedback: {prev_conv['user_feedback']}
-                Feedback Query: {prev_conv['feedback_query']}
+                User Feedback Analysis:
+                - Previous Query: {prev_conv['feedback_query']}
+                - User's Feedback: {prev_conv['user_feedback']}
+
+                <feedback_context>
+                - Consider if feedback mentions missing or incorrect dimensions
+                - Check if feedback suggests different granularity levels
+                - Look for references to wrong hierarchies or dimension combinations
+                - Analyze if temporal dimensions need adjustment
+                - Consider if feedback implies need for additional filtering dimensions
+                </feedback_context>
                 """
 
             query_dim = f""" 
-            As an query to cube query convertion expert, analyze the user's question and identify all required dimension information.
+            As an query to cube query conversion expert, analyze the user's question and identify all required dimension information.
             
             User Query: {query}
 
-            Below is the previous conversation details:-
+            Previous Conversation Context:
             Previous Query: {prev_conv["query"]}
             Previous Dimensions: {prev_conv["dimensions"]}
             Previous Cube Query: {prev_conv["response"]}
+
             {feedback_section}
 
-            <conversation_context>
-            - Consider if this is a follow-up question that might reference previous dimensions implicitly
-            - Look for temporal references like "last year", "previous month", etc.
-            - Check for comparative references like "same as before but for..."
-            - Identify any implicit dimensions that might be carried over from context
-            </conversation_context>
+            <dimension_guidelines>
+            - Select appropriate dimension group names and levels based on requirements
+            - Ensure temporal dimensions match required granularity
+            - Include necessary hierarchical dimensions
+            - Consider geography and organizational hierarchies if relevant
+            - Add any filtering dimensions needed for context
+            </dimension_guidelines>
+
+            <validation_rules>
+            - Verify all dimensions exist in the cube structure
+            - Check dimension hierarchy compatibility
+            - Ensure temporal granularity matches requirements
+            - Validate dimension combinations are valid
+            </validation_rules>
 
             Response format:
             '''json
-            {
+            {{
                 "dimension_group_names": ["group1", "group2"],
-                "dimension_level_names": ["level1", "level2"]
-            }
+                "dimension_level_names": ["level1", "level2"],
+                "reasoning": ["reason for selecting each dimension"]
+            }}
             '''
             """
 
@@ -213,12 +163,20 @@ def get_measures(self, query: str, cube_id: str, prev_conv: dict) -> str:
     """Extract measures with feedback consideration"""
     try:
         with get_openai_callback() as msr_cb:
-            # Add feedback context if exists  
             feedback_section = ""
             if "user_feedback" in prev_conv:
                 feedback_section = f"""
-                Previous User Feedback: {prev_conv['user_feedback']}
-                Feedback Query: {prev_conv['feedback_query']}
+                User Feedback Analysis:
+                - Previous Query: {prev_conv['feedback_query']}
+                - User's Feedback: {prev_conv['user_feedback']}
+
+                <feedback_context>
+                - Check if feedback mentions incorrect measures
+                - Look for references to wrong calculations or aggregations
+                - Consider if additional measures are needed
+                - Analyze if measure combinations need adjustment
+                - Verify if user wants different measure formats
+                </feedback_context>
                 """
 
             query_msr = f""" 
@@ -226,18 +184,35 @@ def get_measures(self, query: str, cube_id: str, prev_conv: dict) -> str:
             
             User Query: {query}
 
-            Below is the previous conversation details:-
+            Previous Conversation Context:
             Previous Query: {prev_conv["query"]}
             Previous Measures: {prev_conv["measures"]}
             Previous Cube Query: {prev_conv["response"]}
+
             {feedback_section}
+
+            <measure_guidelines>
+            - Select appropriate measure groups based on analysis needs
+            - Choose correct aggregation functions
+            - Include calculated measures if needed
+            - Consider measure combinations for analysis
+            - Add trending or comparison measures if relevant
+            </measure_guidelines>
+
+            <validation_rules>
+            - Verify all measures exist in the cube
+            - Check measure compatibility
+            - Ensure aggregations are appropriate
+            - Validate calculation methods
+            </validation_rules>
 
             Response format:
             '''json
-            {
+            {{
                 "measure_group_names": ["group1", "group2"],
-                "measure_names": ["measure1", "measure2"]
-            }
+                "measure_names": ["measure1", "measure2"],
+                "reasoning": ["reason for selecting each measure"]
+            }}
             '''
             """
 
@@ -263,35 +238,64 @@ def get_measures(self, query: str, cube_id: str, prev_conv: dict) -> str:
         raise
 
 def generate_query(self, query: str, dimensions: str, measures: str, prev_conv: dict) -> str:
-    """Generate query with feedback consideration"""
+    """Generate OLAP query with feedback consideration"""
     try:
-        # Add feedback context if exists
         feedback_section = ""
         if "user_feedback" in prev_conv:
             feedback_section = f"""
-            Previous User Feedback: {prev_conv['user_feedback']}
-            Feedback Query: {prev_conv['feedback_query']}
+            User Feedback Analysis:
+            - Previous Query: {prev_conv['feedback_query']}
+            - User's Feedback: {prev_conv['user_feedback']}
+
+            <feedback_context>
+            - Consider specific issues mentioned in feedback
+            - Look for syntax or structure preferences
+            - Check for formatting requirements
+            - Analyze if query complexity needs adjustment
+            - Consider performance implications
+            </feedback_context>
             """
 
-        final_prompt = f"""Generate a precise OLAP cube query based on the following inputs and requirements.
+        final_prompt = f"""
+        Generate a precise OLAP cube query based on the following inputs and requirements.
 
-        Input Context:
+        Current Context:
         - User Query: {query}
-        - Dimensions: {dimensions}
-        - Measures: {measures}
+        - Selected Dimensions: {dimensions}
+        - Selected Measures: {measures}
 
         Previous Context:
         - Previous Query: {prev_conv["query"]}
         - Previous Dimensions: {prev_conv["dimensions"]}
         - Previous Measures: {prev_conv["measures"]}
         - Previous Cube Query: {prev_conv["response"]}
+
         {feedback_section}
 
-        Requirements:
+        <query_requirements>
         1. Generate a single-line OLAP query without line breaks
-        2. Always start with 'select' followed by dimensions and measures
-        3. Always use the exact cube name: [Cube].[Credit One View]
-        4. Include 'as' aliases for all columns in double quotes        
+        2. Start with 'select' followed by dimensions then measures
+        3. Use exact cube name: [Cube].[Credit One View]
+        4. Include "as" aliases for all columns in double quotes
+        5. Use proper dimension hierarchy references
+        6. Include appropriate measure calculations
+        7. Add filtering conditions if needed
+        8. Ensure correct date/time handling
+        </query_requirements>
+
+        <validation_rules>
+        - Verify all dimension references are valid
+        - Check measure calculations are correct
+        - Ensure proper syntax for filters
+        - Validate temporal references
+        - Check alias naming consistency
+        </validation_rules>
+
+        Examples of specific functions:
+        - TimeBetween for date ranges
+        - TrendNumber for year-over-year/period comparisons
+        - Head/Tail for top/bottom N queries
+        - RunningSum/PercentageOfRunningSum for cumulative calculations
         """
         
         result = self.llm.invoke(final_prompt)
