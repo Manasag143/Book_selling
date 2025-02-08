@@ -1,1 +1,137 @@
+Domain Specific Fine Tuning for Data Extraction in ESG Documents
+
+Introduction
+Over the past few years, there have been significant enhancements in the implementation and adoption of large language models (LLMs) which has created a significant drive for implementing LLMs in automating several process workflows that include data extraction, report generation and data standardization across financial organizations. The ESG sector is perpetually adapting to technological innovations to facilitate the simplification of the complex process ensuring the accuracy and consistency of all reports to increase the overall efficiency wither through complete automation or partial automation. Data extraction is a process through which a specified set of key performance indicators (KPIs) are filtered through a pool of complex information, most commonly documents which can help ESG stakeholders to make informed decisions. LLMs have shown a great level of potential in extracting information from complex information sources due to their ability to have contextual understanding. However, general-purpose LLMs struggle with the specialized terminology, complex formatting, and nuanced language typical of ESG documents, which often contain key metrics like emissions data or compliance indicators embedded within both structured and unstructured formats. Fine-tuning enables LLMs to accurately recognize and extract ESG-specific information, reducing errors and improving consistency across documents. In this study, a comparative analysis of GPT-4o mini LLM and fine-tuned Llama-3.1-8b LLM model has been performed on a specified list of KPIs. Also, the potential challenges, opportunities and solutions related to the fine tuning of domain specific LLMs have been discussed.
+Use Case Background
+The ESG team, which is a part of GIX is responsible for extracting a specific set of key performance indicators (KPIs) on a periodic basis. The process of extracting KPIs requires an analyst to extract each KPI from a document which consists of structured and unstructured information. The tight deadlines for processing huge volumes of documents have created a bottle neck for the business team to extract the KPIs precisely and efficiently in a timely manner.
+Domain-specific fine-tuning of Large Language Models (LLMs) related to Environmental, Social, and Governance (ESG) involves training these models on ESG-focused datasets to improve their performance in understanding, analyzing, and extract information from the documents which can result in improved accuracy in the extraction of KPIs thereby reducing the overall efforts required to process the documents.
+Solution Approach
+ 
+				Figure 1. Schematic representation of working solution with its components
+
+Performance Efficient Fine-tuning (PEFT) was used to fine tune Llama-3.1-8b model for Retrieval-Augmented Generation (RAG) task to perform ESG data extraction. This solution uses QLoRA, and UnsloT for optimal performance. PEFT is based on supervised fine tuning (SFT) which allows the model to learn ESG-specific terminology and data structures through labeled datasets along with performance-efficient training methods, such as gradient checkpointing, reduce memory use and computational load. QLoRA enables efficient low-rank adaptation by quantizing the model, maintaining accuracy while making large-scale fine-tuning cost-effective. Lastly, Unsloth was used for integrating various tuning techniques, reducing complexity and maximizing accuracy with fewer parameters. Together, these methods create an efficient, high-performing RAG model tailored to ESG-specific data extraction and question answering. 
+Approach in POC – The approach included curation of labelled dataset, dataset generation, fitting the data and 
+The Key components in the solution are listed below –
+1)	Data Curation – Since the domain specific fine tuning was done specifically for retrieval augmented generation (RAG) task of data extraction, there were three major components of the dataset: question, chunk true which is the context in which the response is present, chunk false which is the context in which the response is not present and chain-of-thought steps based on which the response could be arrived from chunk true. The KPIs were considered as question, the top k most similar chunks to the KPI from the PDF was considered as chunk true, the ground truth was considered as the answer. Now, based on the top similar chunks, question and the answer, GPT-4o mini was used to generate chain-of-thought steps based on which the model can arrive to the given answer based on chunk true. The following prompt was used for generating chain-of-thought reasoning steps:
+
+System Prompt: You are a reasoning assistant that processes a question, an answer, and a context extracted from a PDF using Python libraries. The context may contain tabular information presented in plain text. Your goal is to generate a step-by-step thought process that checks the context for the required information but **does not alter the provided answer** under any circumstances. The output must follow this format:
+“Thought process:  
+1. [First step in reasoning]  
+2. [Second step in reasoning]  
+3. [Third step in reasoning]  
+...  
+<<Answer>>: [final answer here]”
+### Key Considerations:
+- The tabular information will be presented in a text format. The system should analyze the text and treat it as if parsing rows and columns, while ensuring the correct values are checked.
+- Handle **percent and ratio conversions** and explain any transformations involved in verifying the answer, but **never modify the answer**. The answer could be converted from percentage to ratio or from ratio to percentage.
+- The answer provided is perfect and does not requires any modifications from the context.
+-Do no incorporate matches with the actual response in reasoning steps. The reasoning steps should only consists of steps through which we arrive to the final answer.
+- If a value is **not present**, is **null**, or cannot be confirmed from the table-like text, describe the steps taken to search for the value and state why it could not be found, without altering the answer.
+### Instructions:
+1. Restate the question for clarity.
+2. Analyze the extracted context: The extracted context could either be in a text format with proper semantic and syntactic structure or like a text extracted from tabular data using python pdf parsers
+3. Carefully verify if the necessary value is present in the context and explain any **numeric conversions** that occur (e.g., percentage to decimal).
+4. If the answer is 'nan' value or 'not applicable' etc. then describe the search process that you would follow to arrive to that conclusion.
+5. If the value is not found, describe the search process but **keep the given answer intact**. 
+
+### **Steps for Verification:**
+- Always assume the provided answer is correct and cannot be changed during the reasoning process.
+- Analyze text-based on the given context
+- Apply simple numeric transformation like percent to ratio or ratio to percent**never modify the given answer**.
+- If a value is missing or null, explain why it cannot be found but still conclude with the provided answer.
+
+User Prompt: - **Question:** {question}
+- **Answer:** {response}
+- **Context:** {context}
+**Request:** Provide a detailed thought process in the following format:
+“Thought process:  
+1. [First step in reasoning]  
+2. [Second step in reasoning]  
+3. [Third step in reasoning]  
+...  
+<<Answer>>: Given final answer here
+If the answer cannot be confirmed from the context, conclude with (use answer only here for comparison and not in reasoning steps):
+“<<Answer>>: Given final answer here or not present (not confirmed from the context).”
+Around 20 PDF samples and 5000 of real-life data points were considered for the data curation step.
+2)	Data Generation: A sample of data was generated using each page from the PDF, based on which the response, chain-of-thought step and the KPI present in that specific page was generated. The following prompt was used for data generation including the KPI: 
+System Prompt: You are an AI assistant tasked with generating ESG's domain specific questions and answers based on the given context. Generate a question specific to ESG domain that can be answered using the information in the context.\n\nPlease generate a different question if previous questions are provided below -\nprevious questions:[{previous_question}]\n\nYou may use below given ESG specific KPIs to formulate your question based on the given context.\n\n## Environmental KPIs\n- Greenhouse gas emissions (Scope 1, 2, and 3)\n- Energy consumption and efficiency\n- Renewable energy usage\n- Water consumption and efficiency\n- Waste generation and recycling rates\n- Resource efficiency metrics\n- Air quality measurements\n- Biodiversity impact\n- Environmental compliance records\n- Investments in environmental initiatives\n\n## Social KPIs\n- Employee diversity statistics (gender, ethnicity, age, etc.)\n- Pay equity ratios\n- Employee turnover rate\n- Worker health and safety incidents\n- Employee training hours\n- Community engagement metrics\n- Customer satisfaction scores\n- Data privacy and security measures\n- Human rights policies and assessments\n- Supply chain labor practices\n\n## Governance KPIs\n- Board diversity statistics\n- Executive compensation structures\n- Ethics violations and reporting mechanisms\n- Anti-corruption and bribery policies\n- Shareholder rights and engagement\n- Risk management procedures\n- ESG oversight at board level\n- Transparency in political contributions\n- Tax strategy and payments\n- Compliance with regulations and standards\n\n## Additional Considerations\n- Industry-specific KPIs (e.g., for finance, manufacturing, technology sectors)\n- Alignment with global frameworks (e.g., GRI, SASB, TCFD)\n- Quantitative vs. qualitative metrics\n- Short-term vs. long-term targets\n- Absolute values and intensity ratios\n- Year-over-year trends and progress towards goals\n- Benchmarking against industry peers\n- Third-party verifications or assurances\n- Materiality assessments informing KPI selection\n- Stakeholder engagement in KPI development\n\nWhen extracting these KPIs, pay attention to:\n\n- Clear definitions and calculation methodologies\n- Data quality and collection processes\n- Scope and boundaries of reporting\n- Contextual information explaining performance\n- Forward-looking targets and commitments\n- Any limitations or challenges in data gathering\n\nThen, provide a comprehensive answer to that question using Chain of Thought reasoning.\n\nVery important: In case the context does not provide any relevant inforamtion related to Environment Social Governance (ESG) domain then reply with - #Context insufficient to answer the question.#\n\nIf context is relevant for ESG then format your response as follows:\n    Question: [Your generated question]\n    Thought process:\n    1. [First step in reasoning]\n    2. [Second step in reasoning]\n    3. [Third step in reasoning]\n    ...\n    <<Answer>>: [Generate final answer here based on the thought process.]
+
+User Prompt: f"Consider the following question {question}, its response {response} and the correponding sufficient context {context} based on which the response to the given question was generated. Now, I want you to provide me with Chain-of-thought reasonings based on which the answer to the given question was extracted using the given context. The context can either have proper sentence structure or can be a parsed text from table for which chain of thought process is strictly required. Also, if the response is '0' or not applicable' there are some instances due to which the response was arrived at 0 or not applicable in the chunk that should be considered in the reasoning. Strictly provide the final response in the following format: Thought process: 1. [First step in reasoning], 2. [Second step in reasoning], 3. [Third step in reasoning]...<<Answer>>: [Generate final answer here based on the thought process.]"
+The data chunks which included true chunks and false chunks were incorporated too. The curated data and the generated data were merged together to create a final dataset.
+
+ 
+Figure 2. JSONL Format Representation for each data point
+
+ The final labelled data was converted into jsonl format (Refer Figure 2) which was then fed as labelled data for fine tuning the model responses. The final labelled dataset consisted of around 30k data points. 
+
+3)	Training the model– The PEFT trainer and SFTTrainer were used for training the Llama3.1-8b model. Supervised Fine Tuning (SFT) adds labelled data to update the weights of a pre-trained model with a large corpus of unlabelled text tokens in order to make the model more aligned towards a specific task. The following configuration for the training parameters were used for the SFTTrainer: 
+Configuration: (
+    dataset_text_field = "text",
+    max_seq_length = 8000,
+    dataset_num_proc = 2,
+    packing = False, 
+    args = TrainingArguments(
+        per_device_train_batch_size = 1,
+        gradient_accumulation_steps = 2,
+        warmup_steps = 5,
+        num_train_epochs = 1,
+        learning_rate = 2e-4,
+        fp16 = not is_bfloat16_supported(),
+        bf16 = is_bfloat16_supported(),
+        logging_steps = 1,
+        optim = "adamw_8bit",
+        weight_decay = 0.01,
+        lr_scheduler_type = "linear",
+        seed = 3407,
+        report_to ="none"
+    ),
+)
+Furthermore, the training was performed using unsloth’s framework that provides efficient and faster training of the models through performing certain heavy mathematical computations manually and handwriting GPU kernels. Low Rank Adaptation (LoRA) which is a type of PEFT in unsloth’s framekwork was implemented in order to get a model to work in specific contexts. The training of LLMs can require a great deal of retraining, changing all its parameters and specifically with the number of parameters in such models, this retraining is expensive and time-consuming. LoRA provides a quick way to adapt the model without retraining it. Instead of completely retraining a model from start to finish, LoRA adds a lightweight, changeable part to the model so that it fits the new context. The following configuration parameters were used in LoRA training using FastLanguageModel.get_peft_model function in unsloth:
+Configuration: (model,
+    r = 16,
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",],
+    lora_alpha = 16,
+    lora_dropout = 0, 
+    bias = "none",  
+    use_gradient_checkpointing = "unsloth", 
+    random_state = 3407,
+    use_rslora = False,  
+    loftq_config = None, 
+)
+4)	Evaluation– After training the model, the fine-tuned version of the Llama3.1-8b model was implemented in the inference pipeline and the responses were generated. The blank values were standardized, and the outputs were preprocessed to determine the number of KPIs that were extracted successfully using the fine-tuned model and obtain an accuracy score. The responses were also generated for the GPT-4o mini model, and the output was processed to generate an accuracy score for the successful detection of the fine-tuned model. The accuracy score of both the models were compared. Also, once the model was finalized the evaluation PDF was converted into a text which consisted of markdown texts in place of tabular information to yield better extraction accuracy of the instances wherein the KPIs were present in tabular format.
+5)	Iterative Training– After all the steps were performed, the model was fine tuned for three iterations through increasing the total number of data points used for fine tuning until satisfactory accuracy responses were achieved. The first iteration consisted of around 35k data points, the second one consisted of around 56 k data points whereas the third and final iteration consisted of around 105k data points. Each model was evaluated to generate a score for each file and then it’s overage was considered as the final score for each iteration.
+Results
+The fine-tuned LLM was executed on 5 ESG sample PDFs to determine the overall accuracy of the fine-tuned model on the inference data points. Each PDF belonged to a specific company and consisted of a defined set of KPIs that was supposed to be extracted. The accuracy was calculated through dividing the total no. of KPIs correctly extracted divided by Total no. of KPIs which was then converted into a percentage value. The total no. of KPIs to be extracted, the total no. of KPIs accurately extracted by the fine-tuned model along with the overall accuracy in percentage has been showcased in Table 1. 
+  
+Table 1: Accuracy of the Fine-Tuned Llama3.1-8b model
+
+The overall accuracy of the defined list of KPIs for 5 company’s PDFs was found to be around 51.62% on 1807 data points. Furthermore, a comparative analysis was done on a specified list of KPIs through extraction process done through a generalized LLM and fine-tuned LLM to understand the overall performance of the fine-tuned model. The comparative analysis was done on 4 sets of PDFs and 1445 data points and has been displayed in Table 2.
+ 
+Table 2: Comparative Accuracy of the Fine-Tuned Llama3.1-8b and GPT-4o mini model
+
+The average accuracy across the 4 PDFs for Llama3.1 fine-tuned model was found to be 48.48% whereas the average accuracy for the GPT-4o mini was 32.72%. Therefore, according to the comparative analysis done on 1445 data points (4 company PDFs), it could be concluded that the fine-tuned Llama-3.1-8b model exceeds the overall performance of the GPT-4o mini model for the given set of KPIs. Even though the fine-tuned model outperforms the generalized LLM module (GPT-4o mini) with respect to the KPI extraction task, an average accuracy of 48.78% would only provide partial automation of the task. Therefore, further improvements should be made to the fine-tuned module. However, the accuracy of blank values i.e., the instances wherein the KPIs were absent in the context was 68.7% for the same set of 5 PDFs which suggests that a majority of accuracy decline is due to the KPIs being present in the context and the model failing to capture it and therefore the improvement steps should focus on improving the extraction process wherein the KPI values are present in the context. Therefore, in order to yield better results and accuracy, the KPIs which were not found or were extremely complex to extract were removed from the analysis for both the models and the accuracy improved significantly for each iteration.
+
+The above results were summarized for the first iteration of Llama-3.1-8b model which was trained on around 35k. However, in order to improve the overall accuracy of the model was iteratively thrice. The second iteration consisted of around 56k data points and the third iteration consisted of around 105k data points.
+ 
+Table 3: Comparative Accuracy of the Fine-Tuned Llama3.1-8b (For three iterations and markdown) with GPT-4o mini model
+
+The average accuracy for the GPT-4o mini through removing the complex and absent entities in the PDF was found to be 45.62%, whereas the accuracy of the fine-tuned Llama-3.1-8b model trained on 35k datapoints was found to be 59.22%. A slight increase in the overall accuracy of the model was observed when the total number of training data was increased from 35k to 56k data points which was 59.94%. However, the accuracy jumped from 59.94% to 63.49% when the model was trained on 105k data points. The best performing model i.e. the final model from the third iteration was used to evaluate the processed PDF in which tabular structure was converted into a markdown through implementing docling. The overall accuracy increased from 63.49% to 69.05% when the evaluated PDFs consisted of a markdown structure for tabular information.
+Discussion
+Based on the experiments conducted to improve the performance of the generalized LLMs through fine tuning using QLoRA for KPI extraction in the ESG domain, the following were the observations –
+Strengths – 
+1.	The model was successfully able to extract exact values for relevant components with extreme precision in the KPI extraction module with an accuracy of around 69.05% on 5 PDFs.
+2.	Comparative analysis showcased that the domain specific fine-tuning Llama-3.1-8b model made the model outperform the general purpose GPT-4o mini in the task of KPI extraction. The model outperformed the responses generated by GPT-4o mini mode with one shot prompting the accuracy of which was around 45.62% through providing an overall accuracy of 63.49% without incorporating the markdown structure.
+3.	The docling module used for converting tabular structures in the PDFs to markdown was successfully implemented and provided an approximate 5.6% increase in the overall accuracy of the fine-tuned model.
+Weakness –
+1.	Complex tabular structures: The model fails to detect the KPIs which are present in complex tabular structure for which docling fails to provide a proper markdown structure.
+2.	Training time: The time taken for fine tuning the model was around 24-48 hours which is pretty high, the overall training time taken could be reduced significantly if we incorporate multiple GPUs so that distributed training can decrease the overall training time.
+Future State of Fine Tuning–
+The domain specific fine tuning appears to be a promising solution retrieval related use cases since it outperformed the GPT-4o mini model with an accuracy percentage of around 69% which outperforms the GPT-4o mini model. The fine tuning pipeline can be further improved through implementing the solutions mentioned below.
+Further Improvements to the performance –
+1.	Multi-GPUs: The existing module of unsloth which was implemented does not support multi-GPUs for training and therefore huggingface could be used for incorporating multi-GPU for training, but it would require an instance that consists of multiple GPUs.
+2.	Complex Tabular structures: The markdown with complex tabular structure could be added into the training set to improve the overall accuracy of the entities present in complex tabular structure thereby improving the overall accuracy of the model.
+Conclusion
+The Llama3.1-8b model was successfully fine-tuned using a type of Performance Efficient Fine Tuning (PEFT) methodology known as LoRA. The model could successfully identify and extract KPI values from a given ESG document with an accuracy of 69.05% with converting tabular structure to markdown and around 63.49% without markdown. As compared to the non-fine-tuned model of GPT-4o mini, the fine-tuned model provided an average accuracy score which was 17.8% better. In conclusion, implementation of Supervised Fine-Tuning’s (SFT) performance-efficient fine-tuning training, i.e., LoRA and implementation using Unsloth framework provides a robust approach to fine-tuning RAG models for ESG data extraction. This tailored solution enhances the model’s understanding of ESG-specific data and data formats, enabling it to deliver accurate and contextually relevant results. By incorporating techniques that balance accuracy with computational efficiency, this approach ensures a scalable, cost-effective model suited for the evolving demands of ESG analysis. The result is an efficient, domain-optimized RAG model capable of delivering reliable insights and supporting informed decision-making in ESG applications.
+The future scope of fine-tuning RAG models for ESG data extraction includes several promising avenues. As ESG standards and regulatory requirements evolve, future iterations of the model can be continually updated through incremental fine-tuning, ensuring alignment with the latest industry guidelines. Additionally, integrating multi-modal capabilities such as processing visual data from charts could enhance the model’s ability to assess environmental impact more holistically. Leveraging advanced reinforcement learning techniques could further improve model accuracy and contextual adaptability based on user feedback, refining performance for highly specific ESG applications. Ultimately, the continued advancement of fine-tuning techniques and ESG-focused datasets will create increasingly powerful tools for sustainable and responsible decision-making through extraction of relevant KPIs. 
+In summary, fine-tuning RAG models for ESG data extraction offers a powerful solution for addressing the complexities of domain-specific information retrieval. By combining techniques like Supervised Fine-Tuning (SFT), performance-efficient training, LoRA, through Unsloth, the approach ensures high accuracy, scalability, and cost efficiency. Looking ahead, the model can evolve to adapt to changing ESG standards through incremental fine-tuning and incorporate multi-modal capabilities for a more comprehensive analysis. Advanced reinforcement learning and user feedback mechanisms can further refine performance, while expanding the approach to other applications in the ESG sector like summarization or report generation. This positions fine-tuned RAG models as essential tools for driving informed, sustainable, and responsible decision-making across ESG-specific use cases.
 
